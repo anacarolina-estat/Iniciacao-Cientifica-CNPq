@@ -1,0 +1,310 @@
+---
+title: "Métodos de aprendizado de máquina supervisionado para classificação aplicados a dados de microarranjo de DNA."
+title: "Códigos R"
+author: "Ana Carolina Alves Oliveira"
+date: "24/09/2020"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Aplicação em Dados Reais
+
+## Curiosidade: Raw Dados (dados brutos)
+
+A matriz dados contém os dados já pré-processados e será usado assim. Mas o ideal é sempre iniciar as análises do "raw" data, usando getGEOSuppFiles("GSE26415"), para baixar e depois usando limma para preprocessar.
+
+Link single-channel agilent: <https://www.bioconductor.org/packages/devel/bioc/vignettes/limma/inst/doc/usersguide.pdf>
+
+O artigo que cita como ocorreu o pré-processamento é: <https://www.ncbi.nlm.nih.gov/pmc/articles/PMC3174190/>
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+# Dados brutos (curiosidade)
+
+library(limma)
+# raw data
+getGEOSuppFiles("GSE26415")
+# deszipar no local
+wd = "/home/ana/Downloads/GSE26415_RAW"
+files <- list.files(wd,full=TRUE,pattern = "txt.gz$")  # wd = getwd()
+x <- read.maimages(files,source="agilent", green.only=TRUE)
+# https://www.bioconductor.org/packages/devel/bioc/vignettes/limma/inst/doc/usersguide.pdf
+# chapter 17.4 tem um exemplo de single-channel agilent
+y <- backgroundCorrect(x, method="normexp") # correção de fundo normexp
+boxplot(log2(x$E),range=0,ylab="log2 intensity")
+boxplot(log2(y$E),range=0,ylab="log2 intensity")
+y1 <- normalizeBetweenArrays(y, method="quantile") # normalização de quantis
+boxplot(log2(y1$E),range=0,ylab="log2 intensity")
+```
+
+
+## Dados Pré-Processados:
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+# Pacotes utilizados:
+
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#install.packages("BiocManager")
+
+#BiocManager::install("GEOquery")
+#install.packages(c("MASS", "ggplot2", "ellipse", "e1071", "caret", "xtable"))
+
+library(GEOquery)
+library(Biobase)
+library(factoextra)
+library(MASS)
+library(ggplot2)
+library(ellipse)
+library(caret)
+library(e1071)
+library(dplyr)
+library(class)
+library(xtable)
+```
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+# Lista com informações sobre os dados 
+gse_autismo_list = getGEO("GSE26415",GSEMatrix=FALSE)
+
+# Pode-se verificar, por exemplo, que os dados possuem 1 canal.
+head(Meta(GSMList(gse_autismo_list)[[1]])) 
+```
+
+### Importação dos Dados
+
+```{r, echo=FALSE}
+# Importando os dados para o R usando o pacote GEOquery
+gse_autismo_matrix = getGEO("GSE26415", GSEMatrix=TRUE) # matriz 
+
+# No caso de obter o seguinte erro: <Error in open.connection(x, "rb") : Could not resolve host: ftp.ncbi.nlm.nih.gov>, executar o código abaixo no console.
+# options('download.file.method.GEOquery' = 'auto') # no console
+
+# Pode-se retirar algumas informações do objeto gse_autismo:
+show(gse_autismo_matrix) # exibição
+show(pData(phenoData(gse_autismo_matrix[[1]]))[1:5,c(1,6,8)]) # metadados 
+
+# Extraindo o conjunto de dados: as linhas correspondem aos genes e as colunas correspondem aos indivíduos   
+datExpr = exprs(gse_autismo_matrix[[1]]) 
+
+# Colocando os dados no formato data frame e formato tidy ()linhas representando as observações e colunas as variáveis)
+dados = as.data.frame(datExpr)
+dados = as.data.frame(t(dados))
+
+# Estraindo as características fenotípicas dos indivíduos
+fenotipo <- pData(gse_autismo_matrix[[1]])
+class = fenotipo$`disease:ch1` # grupos 
+
+# Dados finais prontas para as análises
+dados = cbind(dados, class=factor(class))
+save(dados,file="dados.rds")
+```
+
+```{r, echo=FALSE}
+load("dados.rds") # carregando os dados 
+```
+
+### Análise descritiva 
+
+#### PCA
+
+PCA tem como objetivo reduzir várias variáveis do conjunto de dados, que serão chamadas de eixos principais. O número de eixos principais corresponde ao número de variáveis, mas em PCA só serão utilizados os dois primeiros eixos, que são os que mais explicam a variabilidade dos dados, respectivamente. É necessário padronizar os dados, uma vez que, eles podem está em escalas diferentes. Para cada eixo, os maiores valores indicam as variáveis mais representativas.
+
+```{r, echo=FALSE}
+# PCA com os dados padronizados 
+xx = dados[,-which(colnames(dados)=="class")]
+PCA = prcomp(x = xx, center = TRUE, scale = TRUE)
+PCs <- PCA$x
+
+# Scree Plot: as duas primeiras dimenções explicam a maior parte da variabilidade dos dados.
+fviz_eig(PCA) 
+```
+
+```{r}
+# Grafico PCA (pontos)
+fviz_pca_ind(PCA,
+             geom.ind = "point",
+             col.ind = "x",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE     # Avoid text overlapping
+             )
+
+```
+
+```{r}
+# Gráfico PCA (elipses)
+fviz_pca_ind(PCA,
+             geom.ind = "point", # show points only (nbut not "text") 
+             col.ind = as.factor(dados$class), # color by groups
+             palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+             addEllipses = TRUE, # Concentration ellipses
+             legend.title = "Groups"
+)
+
+# Note que não estão bem separadas. Para tentar melhorar isso, será utilizado LDA, que leva a classe os indivíduos em consideração. 
+```
+
+
+#### LDA
+
+Diferentemente do PCA, o LDA leva o grupo do indivíduos em consideração (além de ser um algoritmo de aprendizado de máquina supervisionado)
+
+```{r, message=FALSE, warning=FALSE, echo = FALSE}
+# Link ref.: <http://compbio.pbworks.com/w/page/16252905/Microarray%20Dimension%20Reduction>
+
+lda = lda(xx, grouping=dados$class)
+lda_pred = predict(lda)
+```
+
+```{r}
+# Gráfico LDA (pontos) 
+# Link ref.: <https://rpubs.com/ifn1411/LDA>
+newdata <- data.frame(class = dados$class, lda = lda_pred$x)
+
+ggplot(newdata) + 
+  geom_point(aes(lda.LD1, lda.LD2, colour = class), size = 1.5) + 
+  ggtitle("LDA") +
+  theme_bw()
+```
+  
+```{r}
+# Gráfico LDA (elipses) 
+# Link ref.: <https://r.789695.n4.nabble.com/LDA-and-confidence-ellipse-td4671308.html>
+
+data_elipse <- data.frame()
+
+for(i in levels(factor(newdata$class))){
+  data_elipse <- rbind(data_elipse, 
+                   cbind(as.data.frame(
+                     with(newdata[newdata$class == i,],
+                          ellipse(cor(lda.LD1, lda.LD2),
+                          scale = c(sd(lda.LD1),sd(lda.LD2)),
+                          centre = c(mean(lda.LD1), 
+                          mean(lda.LD2))))), class = i))
+}
+
+ggplot(newdata, aes(x = lda.LD1, y = lda.LD2, col = class)) + 
+  geom_point( size = 1.5, aes(color = class)) + 
+  ggtitle("LDA") + 
+  theme_bw() + 
+  geom_path(data = data_elipse, 
+            aes(x = x, y = y, color = class), size = 1, linetype = 2) 
+
+```
+
+
+### Aprendizado de Máquina (usando o pacote caret)
+
+#### KNN 
+
+Algortimo de aprendizdo de máquina supervisionado para classificação. 
+
+Link ref.: <https://www.youtube.com/watch?v=kXDO0BNHFVA>
+Link ref.: <https://dataaspirant.com/knn-implementation-r-using-caret-package/>
+
+Sobre avaliar o modelo: <https://rpubs.com/PMONIZ80/506010>
+
+```{r}
+# Divisão dos Dados   
+n = nrow(dados)
+set.seed(21264) # semente
+index = sample(1:n, n*0.75, replace = FALSE) # aleatorização 
+
+amostra <- sample(1:dim(xx)[2],16650,replace=FALSE)
+train = cbind(xx[index,amostra],class=dados$class[index]) # conjunto de dados de treinamento
+test = cbind(xx[-index,amostra],class=dados$class[-index]) # conjunto de dados de teste
+```
+
+```{r}
+# Treinando dados
+trControl <- trainControl(method  = "cv", number  = 3) # validação cruzada 
+
+set.seed(19) 
+# Criando o modelo
+fit = train(class~., method = "knn",
+            tuneGrid=expand.grid(k = 1:5), trControl =trControl, 
+            metric="Accuracy", data=train)
+
+```
+
+```{r}
+# Vizualização de resultados
+
+# Para lattex:
+tabela1 = fit$results[,1:3]
+xtable(tabela1)
+
+# Figura 1: Acurácia para diferentes valores de k no algorítimo KNN (seria interessante para vários k's)
+ggplot(data = tabela1, aes(x = k, y = Accuracy)) +
+    labs(x = "k", y = "Acurácia") +
+    geom_line() +
+    geom_point() + theme_bw()
+```
+
+```{r}
+# Predição das classes do conjunto de teste
+set.seed(675)  
+test_pred <- predict(fit, newdata = test)
+test_pred
+
+# Matriz de Confusão
+confusionMatrix(test_pred, test$class)
+```
+
+```{r}
+# Vizualização dos resultados 
+
+tabela2 = confusionMatrix(test_pred, test$class)
+xtable(tabela2$table) # p/ lattex 
+```
+
+
+#### LDA
+
+```{r}
+# Modelo LDA usando as 10 primeiras componentes do PCA 
+# Link ref.: <https://stackoverflow.com/questions/36329201/r-how-to-set-a-specific-number-of-pca-components-to-train-a-prediction-model>
+
+# varidação cruzada + 10 primeiras componentes principais 
+trControl <- trainControl(method  = "cv", number  = 5, preProcOptions = list(pcaComp = 10)) 
+
+# Criando o modelo
+set.seed(100) 
+fit2 = train(class~., method = "lda", trControl =trControl, 
+            metric="Accuracy", preProcess = c('pca'), data=train)
+
+```
+
+```{r}
+# Vizualização de resultados
+tabela2 = fit2$results[,c(2,3)]
+xtable(tabela2) # para lattex 
+```
+
+```{r}
+# Predição das classes do conjunto de teste
+set.seed(2126)  
+test_pred <- predict(fit2, newdata = test)
+test_pred
+
+# Matriz de Confusão
+confusionMatrix(test_pred, test$class)
+```
+
+```{r}
+# Vizualização dos resultados 
+
+tabela4 = confusionMatrix(test_pred, test$class)
+xtable(tabela4$table) # para lattex 
+```
+
+
+
+
+
+
+
+
